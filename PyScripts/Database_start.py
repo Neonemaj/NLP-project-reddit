@@ -16,11 +16,13 @@ reply_columns_global = ['Reply_id', 'Author', 'Created', 'Submission_id', 'Paren
 subreddit_columns_global = ['Id', 'Name', 'Description', 'Public_description', 'Created', 'Subscribers']
 table_names = ('Posts', 'Subreddits', 'Comments', 'Replies')
 
-def reddit_object(current_path, password):
-    c=Fernet(f'{password}=')
-    private_json_path = os.path.join(current_path, "private.json")
-    with open(private_json_path, "rb") as f:ec=json.loads(c.decrypt(f.read()).decode())
-    ci,cs,rt=c.decrypt(base64.b64decode(ec["client_id"])).decode(),c.decrypt(base64.b64decode(ec["client_secret"])).decode(),c.decrypt(base64.b64decode(ec["refresh_token"])).decode()
+def reddit_object(private_path, password):
+    key=Fernet(f'{password}=')
+    with open(private_path, "rb") as f:
+        ec=json.loads(key.decrypt(f.read()).decode())
+    ci = key.decrypt(base64.b64decode(ec["client_id"])).decode()
+    cs = key.decrypt(base64.b64decode(ec["client_secret"])).decode()
+    rt = key.decrypt(base64.b64decode(ec["refresh_token"])).decode()
 
     reddit = praw.Reddit(
         client_id = ci,
@@ -297,15 +299,23 @@ def fill_tables(query: str,
     
     conn.commit()
 
-def main():
-    current_path = os.path.dirname(os.path.abspath(__file__))
+def main(): # for testing
+    # Sorting out paths
+    current_dir = os.path.dirname(os.path.realpath(__file__)) # PyScripts directory path
+    data_directory_name = "Data"
+    config_files_directory_name = "config" # where private.json is stored
+    data_dir = os.path.join(current_dir, '..', data_directory_name) # assuming Data and PyScripts are both in main
+    private_path = os.path.join(data_dir, config_files_directory_name, "private.json")
+    
+    # Inputs
     password = input("Provide a password do reddit API: ")
-    database_path = f'{input("Provide database name: ")}.db'
+    database_name = f'{input("Provide database name: ")}.db'
     query = input("Provide query for search: ")
-    reddit = reddit_object(current_path=current_path, password=password)
-    conn, cursor = start_connection(database_path=os.path.join(current_path, database_path))
+    
+    reddit = reddit_object(private_path=private_path, password=password)
+    conn, cursor = start_connection(database_path=os.path.join(data_dir, database_name))
     prepare_database(conn=conn, cursor=cursor)
-    print(f'Inserting values into database {database_path}...')
+    print(f'Inserting values into database {database_name}...')
     fill_tables(query=query,
                 posts_limit=300,
                 comments_limit=50,
@@ -318,3 +328,10 @@ def main():
     
 if __name__ == "__main__":
     main()
+    
+    # To do:
+    #   error handling within functions
+    #   basic input preprocessing
+    #   docstrings and type hinting
+    #   move path functionality somewhere else (maybe?)
+    #   set posts/comments/replies limits to be either as a presets in file inside 'config', or UI sliders
