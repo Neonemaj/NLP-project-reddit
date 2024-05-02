@@ -11,8 +11,8 @@ import sqlite3
 
 post_columns_global = ['Id', 'Title', 'Author', 'Author_flair', 'Created', 'Subreddit', 'Subreddit_id', 'Text',
                 'Text_content', 'Num_comments', 'Score', 'Upvote_ratio', 'Stickied', 'Distinguished', 'URL']
-comment_columns_global = ['Comment_id', 'Author', 'Created', 'Submission_id', 'Text_content', 'Num_replies', 'Score', 'Stickied', 'Distinguished']
-reply_columns_global = ['Reply_id', 'Author', 'Created', 'Submission_id', 'Parent_id', 'Text_content', 'Score', 'Stickied', 'Distinguished']
+comment_columns_global = ['Id', 'Author', 'Created', 'Submission_id', 'Text_content', 'Num_replies', 'Score', 'Stickied', 'Distinguished']
+reply_columns_global = ['Id', 'Author', 'Created', 'Submission_id', 'Parent_id', 'Text_content', 'Score', 'Stickied', 'Distinguished']
 subreddit_columns_global = ['Id', 'Name', 'Description', 'Public_description', 'Created', 'Subscribers']
 table_names = ('Posts', 'Subreddits', 'Comments', 'Replies')
 
@@ -67,78 +67,84 @@ def prepare_database(conn=None, cursor=None, tables=table_names):
         for table in tables:
             cursor.execute(f'''DELETE FROM {table}''')
     else:
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS Posts (
-                Id TEXT PRIMARY KEY,
-                Title TEXT,
-                Author TEXT,
-                Author_flair TEXT,
-                Created TEXT,
-                Subreddit TEXT,
-                Subreddit_id TEXT,
-                Text TEXT,
-                Text_content TEXT,
-                Num_comments INTEGER,
-                Score INTEGER,
-                Upvote_ratio REAL,
-                Stickied INTEGER,
-                Distinguished TEXT,
-                URL TEXT
-            )
-        ''')
+        cursor.execute("BEGIN TRANSACTION;")
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS Posts (
+                    Id TEXT PRIMARY KEY,
+                    Title TEXT,
+                    Author TEXT,
+                    Author_flair TEXT,
+                    Created TEXT,
+                    Subreddit TEXT,
+                    Subreddit_id TEXT,
+                    Text TEXT,
+                    Text_content TEXT,
+                    Num_comments INTEGER,
+                    Score INTEGER,
+                    Upvote_ratio REAL,
+                    Stickied INTEGER,
+                    Distinguished TEXT,
+                    URL TEXT
+                )
+            ''')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS Subreddits (
-                Id TEXT PRIMARY KEY,
-                Name TEXT,
-                Description TEXT,
-                Public_description TEXT,
-                Created TEXT,
-                Subscribers INTEGER,
-                FOREIGN KEY (Id) REFERENCES Posts(Subreddit_id) ON DELETE CASCADE
-            )
-        ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS Subreddits (
+                    Id TEXT PRIMARY KEY,
+                    Name TEXT,
+                    Description TEXT,
+                    Public_description TEXT,
+                    Created TEXT,
+                    Subscribers INTEGER,
+                    FOREIGN KEY (Id) REFERENCES Posts(Subreddit_id) ON DELETE CASCADE
+                )
+            ''')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS Comments (
-                Comment_id TEXT PRIMARY KEY,
-                Author TEXT,
-                Created TEXT,
-                Submission_id TEXT NOT NULL ON CONFLICT IGNORE,
-                Text_content TEXT NOT NULL ON CONFLICT IGNORE,
-                Num_replies INTEGER,
-                Score INTEGER,
-                Stickied INTEGER,
-                Distinguished TEXT,
-                FOREIGN KEY (Submission_id) REFERENCES Posts(id) ON DELETE CASCADE
-            )
-        ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS Comments (
+                    Id TEXT PRIMARY KEY,
+                    Author TEXT,
+                    Created TEXT,
+                    Submission_id TEXT NOT NULL ON CONFLICT IGNORE,
+                    Text_content TEXT NOT NULL ON CONFLICT IGNORE,
+                    Num_replies INTEGER,
+                    Score INTEGER,
+                    Stickied INTEGER,
+                    Distinguished TEXT,
+                    FOREIGN KEY (Submission_id) REFERENCES Posts(id) ON DELETE CASCADE
+                )
+            ''')
 
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS Replies (
-                Reply_id TEXT PRIMARY KEY,
-                Author TEXT,
-                Created TEXT,
-                Submission_id TEXT NOT NULL ON CONFLICT IGNORE,
-                Parent_id TEXT NOT NULL ON CONFLICT IGNORE,
-                Text_content TEXT NOT NULL ON CONFLICT IGNORE,
-                Score INTEGER,
-                Stickied INTEGER,
-                Distinguished TEXT,
-                FOREIGN KEY (Submission_id) REFERENCES Posts(id) ON DELETE CASCADE,
-                FOREIGN KEY (Parent_id) REFERENCES Comments(Comment_id) ON DELETE CASCADE
-            )
-        ''')
-        
-        # Indexes. Might need to add more if I find out certain queries are repeatable
-        cursor.execute('CREATE INDEX idx_Posts_Subreddit_id ON Posts(Subreddit_id);')
-        cursor.execute('CREATE INDEX idx_Comments_Submission_id ON Comments(Submission_id);')
-        cursor.execute('CREATE INDEX idx_Replies_Submission_id ON Replies(Submission_id);')
-        cursor.execute('CREATE INDEX idx_Replies_Parent_id ON Replies(Parent_id);')
-        
-    conn.commit()
-
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS Replies (
+                    Id TEXT PRIMARY KEY,
+                    Author TEXT,
+                    Created TEXT,
+                    Submission_id TEXT NOT NULL ON CONFLICT IGNORE,
+                    Parent_id TEXT NOT NULL ON CONFLICT IGNORE,
+                    Text_content TEXT NOT NULL ON CONFLICT IGNORE,
+                    Score INTEGER,
+                    Stickied INTEGER,
+                    Distinguished TEXT,
+                    FOREIGN KEY (Submission_id) REFERENCES Posts(id) ON DELETE CASCADE,
+                    FOREIGN KEY (Parent_id) REFERENCES Comments(Comment_id) ON DELETE CASCADE
+                )
+            ''')
+            # Indexes. Might need to add more if I find out certain queries are repeatable
+            cursor.execute('CREATE INDEX idx_Posts_Subreddit_id ON Posts(Subreddit_id);')
+            cursor.execute('CREATE INDEX idx_Comments_Submission_id ON Comments(Submission_id);')
+            cursor.execute('CREATE INDEX idx_Replies_Submission_id ON Replies(Submission_id);')
+            cursor.execute('CREATE INDEX idx_Replies_Parent_id ON Replies(Parent_id);')
+            cursor.execute('COMMIT;')
+            
+        except sqlite3.Error as e:
+            print("SQLite error:", e.__class__.__name__, "\n", e)
+            cursor.execute("ROLLBACK;")
+        except Exception as e:
+            print("Error:", e.__class__.__name__, "\n", e)
+            cursor.execute("ROLLBACK;")
+            
 def process_post_batch(posts, comments_limit, replies_limit) -> Tuple[Set[Tuple], Set[Tuple], Set[Tuple], Set[Tuple]]:
     comment_data = set()
     reply_data = set()
@@ -199,7 +205,7 @@ def process_comments(post, comments_limit, replies_limit) -> Tuple[Set[Tuple], S
                 reply.author.name if reply.author else None,
                 datetime.fromtimestamp(reply.created_utc),
                 post.id,
-                comment.id, # instead of: reply.parent_id
+                reply.parent_id, # instead of: reply.parent_id, comment.id
                 reply.body,
                 reply.score,
                 reply.stickied,
@@ -292,12 +298,20 @@ def fill_tables(query: str,
     insert_comments_query = f'INSERT OR IGNORE INTO {table_names[2]} ({", ".join(comment_columns_local)}) VALUES ({", ".join(["?"] * len(comment_columns_local))})'
     insert_replies_query = f'INSERT OR IGNORE INTO {table_names[3]} ({", ".join(reply_columns_local)}) VALUES ({", ".join(["?"] * len(reply_columns_local))})'
     
-    cursor.executemany(insert_posts_query, post_data)
-    cursor.executemany(insert_subreddits_query, subreddit_data)
-    cursor.executemany(insert_comments_query, comment_data)
-    cursor.executemany(insert_replies_query, reply_data)
-    
-    conn.commit()
+    cursor.execute("BEGIN TRANSACTION;")
+    try:
+        cursor.executemany(insert_posts_query, post_data)
+        cursor.executemany(insert_subreddits_query, subreddit_data)
+        cursor.executemany(insert_comments_query, comment_data)
+        cursor.executemany(insert_replies_query, reply_data)
+        cursor.execute("COMMIT;")
+        
+    except sqlite3.Error as e:
+        print("SQLite error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")
+    except Exception as e:
+        print("Error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")
 
 def main(): # for testing
     # Sorting out paths
@@ -330,8 +344,8 @@ if __name__ == "__main__":
     main()
     
     # To do:
-    #   error handling within functions
     #   basic input preprocessing
     #   docstrings and type hinting
     #   move path functionality somewhere else (maybe?)
     #   set posts/comments/replies limits to be either as a presets in file inside 'config', or UI sliders
+    #   comment_id withing replies. Handle it differently.
