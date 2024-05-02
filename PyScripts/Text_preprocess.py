@@ -1,13 +1,18 @@
 import sqlite3
 import spacy
+from spacy.lang.en.stop_words import STOP_WORDS
+from string import punctuation
 import os
+import json
 import re
 from typing import Dict, List, Tuple
-from collections import OrderedDict
 
 # config
+# if table_names will be parameterized, ensure its sanitazed to prevent dangerous injection to sql
 table_names = ('Posts', 'Subreddits', 'Comments', 'Replies')
+new_columns_global = ['Raw_tokens', 'Lemma_lower_tokens', 'Lemma_lower_stop_tokens']
 nlp_model = spacy.load('en_core_web_md')
+STOP_WORDS_SET = set(STOP_WORDS) # for faster retrieval
 
 def check_column_exist(cursor: sqlite3.Cursor, check_dict: Dict[str, List[str]]) -> bool:
     '''
@@ -103,12 +108,13 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
     '''
     
     local_table_names = table_names # assuming order: Posts, Subreddits, Comments, Replies
+    # hard-coding table_columns_dict for now
     column_names_ordered = [['Text_content'], ['Description', 'Public_description'], ['Text_content'], ['Text_content']]
     table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
     assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict -> {table_columns_dict}'
     
     create_regex_replace(conn=conn, cursor=cursor)
-
+    cursor.execute("BEGIN TRANSACTION;")
     try:
         # Posts table
         cursor.execute("""
@@ -290,115 +296,124 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
             WHERE Text_content IS NULL;
         """.format(local_table_names[3]))
         
-        conn.commit()
+        cursor.execute("COMMIT;")
     
-    # Error handling and rollback is not necessary in sqlite, since it won't commit changes if there will be error in execution.
-    # Writing error handling just for practice.
-    except sqlite3.OperationalError as e:
-        print("An operational error occurred:", e)
-        conn.rollback()
-
-    except sqlite3.IntegrityError as e:
-        print("An integrity error occurred:", e)
-        conn.rollback()
-
-    except sqlite3.DatabaseError as e:
-        print("A database error occurred:", e)
-        conn.rollback()
-        
+    except sqlite3.Error as e:
+        print("SQLite error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")  
     except Exception as e:
-        print("An unexpected error occurred:", e)
-        conn.rollback()
-        
-def count_entities(text_content: List[str],
-                   nlp_model: spacy.lang.en.English,
-                   entity_count: Dict[str, int],
-                   text_content_count: int) -> Tuple[Dict[str, int], int]:
+        print("Error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")
+
+def tokenize_and_json_serialize(nlp_model: spacy.lang.en.English, text: str) -> Tuple[str, str, str]:
     '''
-    Counts entities recognized by SpaCy in provided list of texts.
+    Tokenizes into 3 different lists and serializes it with json into string.
     
     Parameters:
-        text_content (List[str]): List of texts to analyze. Usually contents of a column from sql table.
-        nlp_model (spacy.lang.en.English): Instance of SpaCy english model used for detecting and labeling entities.
-        entity_count (Dict[str, int]): Dictionary of entities: number of occurences, that will be updated adding new counts.
-        text_content_count (int): Number of already analyzed text blocks that will be updated adding new values.
+        nlp_model (spacy.lang.en.English): Instance of SpaCy english model used for tokenizing text.
+        text (str): Text that will be tokenized and serialized.
         
     Returns:
-        Tuple[Dict[str, int], int]: Tuple of [0]: updated entity_count and [1]: updated number of analyzed blocks.
-        
-    Example:
-        count_entities(text_content=['Bach', 'Mozart 42'],
-                       nlp_model=nlp_model,
-                       entity_count={'Bach': 3, 'Buxtehude': 1},
-                       text_content_count=6) ->
-        ({'Bach': 4, 'Buxtehude': 1, 'Mozart': 1}, 8)
+        Tuple[str, str, str]: 3 strings:
+            1. Serialized raw tokens from the text.
+            2. Serialized tokens that were lemmatized and lowercased.
+            3. Serialized lemmatized and lowercased tokens without stop words.
+    '''
+    if text is None:
+        return None, None, None
+    doc = nlp_model(text)
+    if doc.lang_ != 'en':
+        return None, None, None
+    raw_tokens = [token.text for token in doc]
+    lemma_lower_tokens = [token.lemma_.lower() for token in doc]
+    lemma_lower_stop_tokens = [token.lemma_.lower() for token in doc if token.text.lower() not in STOP_WORDS_SET and token.text not in punctuation]
+    
+    raw_serialized = json.dumps(raw_tokens)
+    lemma_lower_serialized = json.dumps(lemma_lower_tokens)
+    lemma_lower_stop_serialized = json.dumps(lemma_lower_stop_tokens)
+    
+    return raw_serialized, lemma_lower_serialized, lemma_lower_stop_serialized
+
+def create_columns_insert_tokens(cursor: sqlite3.Cursor, table_name: str, serialized_values: List[Tuple[str, str, str]]) -> None:
+    '''
+    Creates 3 new columns for different versions of serialized tokens and populates them.
+    
+    Parameters:
+        cursor (sqlite3.Cursor): Cursor object used for querying.
+        table_name (str): Name of a table that will be altered and populated.
+        serialized_values (List[Tuple[str, str, str]]): Values which will be inserted into a table.
         
     Notes:
-        - SpaCy language model is supposed to omit entities with labels: ['DATE', 'TIME', 'MONEY', 'PERCENT', 'CARDINAL', 'ORDINAL', 'QUANTITY'].
-        - Function is adding cumulatively lemmatized form of entities.
+        - Function modifies table in-place and does not return any value.
+        - This function will only create missing columns <-> won't create any if there already are these 3 exact columns in a table.
+        - Function overwrites values that already exist in those columns.
+        - Raises AssertionError when the length of serialized_values do not match length of a table.
     '''
-    for text in text_content:
-        if text == None:
-            continue
-        text_content_count += 1
-        doc = nlp_model(text)
-        for entity in doc.ents:
-            if entity.label_ in ['DATE', 'TIME', 'MONEY', 'PERCENT', 'CARDINAL', 'ORDINAL', 'QUANTITY']:
+    new_columns = new_columns_global
+    cursor.execute("BEGIN TRANSACTION;")
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        current_column_list = [col[1] for col in cursor.fetchall()]
+        for column_name in new_columns:
+            if column_name in current_column_list:
                 continue
-            elif entity.lemma_ not in entity_count.keys():
-                entity_count[entity.lemma_] = 1
             else:
-                entity_count[entity.lemma_] += 1
-                
-    return entity_count, text_content_count
+                cursor.execute(f'''
+                    ALTER TABLE {table_name}
+                    ADD COLUMN {column_name} TEXT;
+                ''')
+        
+        query = f'UPDATE {table_name} SET ({", ".join(new_columns)}) = ({", ".join(["?" for _ in range(len(new_columns))])}) WHERE Id = ?;'
+        cursor.executemany(query, serialized_values)
+        cursor.execute("COMMIT;")
+        
+    except sqlite3.Error as e:
+        print("SQLite error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")
+    except Exception as e:
+        print("Error:", e.__class__.__name__, "\n", e)
+        cursor.execute("ROLLBACK;")
 
-def count_entities_from_tables(cursor: sqlite3.Cursor,
-                               nlp_model: spacy.lang.en.English,
-                               table_names: Tuple) -> Tuple[OrderedDict[str, int], int]:
+def main_loop_for_tokenizing(cursor: sqlite3.Cursor,
+                             nlp_model: spacy.lang.en.English,
+                             table_columns_dict: Dict[str, List[str]]) -> None:
     '''
-    Counts valid entities from given tables and number of analyzed text blocks.
+    Iterates over text columns and text blocks in given tables to unpack text for other functions.
     
     Parameters:
         cursor (sqlite3.Cursor): Sqlite Cursor object needed to retrieve text contents from sql tables.
-        nlp_model (spacy.land.en.English): Instance of SpaCy english model used for detecting and labeling entities.
-        table_names (Tuple): Tuple of table names with text column to analyze.
-        
-    Returns:
-        Tuple[Dict[str, int], int]: Tuple of a [0]: SortedDictionary (descending) with keys as entities and
-            values - number of occurences of this entity, and [1]: number of analyzed text blocks throughout tables.
-            
-    Example:
-        count_entities_from_tables(cursor=cursor,
-                                   nlp_model=nlp_model,
-                                   table_names=(Posts, Subreddits, Comments, Replies))
+        nlp_model (spacy.land.en.English): Instance of SpaCy english model used for inner functions to analyze text.
+        table_columns_dict (Dict[str, List[str]]): Dictionary with keys as table names and values being a list of column names corresponding to this table.
                                    
     Notes:
-        - Assumed order of tables: Posts, Subreddits, Comments, Replies.
-        - Assumed columns with text_contents with matching order: [['Text_content'], ['Public_description'], ['Text_content'], ['Text_content']]
+        - Returns nothing. Gathers text blocks/columns to use for functions:
+            tokenize_and_json_serialize() and create_columns_insert_tokens().
+        - Raises AssertionError when one or more columns were not found in tables according to a structure of table_columns_dict.
+        - Raises AssertionError when the length of serialized_values do not match length of a table.
     '''
-    column_names_ordered = [['Text_content'], ['Public_description'], ['Text_content'], ['Text_content']]
-    table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
-    assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict: {table_columns_dict}'
+    assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict -> {table_columns_dict}'
     
-    entity_count = dict()
-    text_content_count = 0
     for table_name, column_list in table_columns_dict.items():
+        serialized_tokens = []
         column_name = column_list[0]
-        cursor.execute(f"SELECT {column_name} FROM {table_name};")
-        text_content = [text[0] for text in cursor.fetchall()]
-        entity_count, text_content_count = count_entities(text_content=text_content,
-                                                          nlp_model=nlp_model,
-                                                          entity_count=entity_count,
-                                                          text_content_count=text_content_count)
- 
-    return OrderedDict(sorted(entity_count.items(), key=lambda x: x[1], reverse=True)), text_content_count
-
-def main(): # testing text cleaning and entity counting
+        cursor.execute(f"SELECT Id, {column_name} FROM {table_name};") # Select primary key AND column_name
+        fetched_results = cursor.fetchall()
+        for id_key, text_block in fetched_results:
+            serialized_tokens.append(tokenize_and_json_serialize(nlp_model=nlp_model, text=text_block) + (id_key,))
+            
+        assert len(serialized_tokens) == len(fetched_results), (
+            'Mismatch of lengths between retrieved serialized tokens and table size.\n'
+            f'{len(serialized_tokens) = }, {len(fetched_results) = }')
+        create_columns_insert_tokens(cursor=cursor,
+                                     table_name=table_name,
+                                     serialized_values=serialized_tokens)
+    
+def main():
     # Connection and paths
     current_dir = os.path.dirname(os.path.realpath(__file__)) # PyScripts directory path
     data_directory_name = "Data"
     data_dir = os.path.join(current_dir, '..', data_directory_name) # assuming Data and PyScripts are both in main
-    database_name = 'iphone11.db'
+    database_name = 'pocketbook.db'
     database_path = os.path.join(data_dir, database_name)
     conn = sqlite3.connect(database_path)
     cursor = conn.cursor()
@@ -406,19 +421,17 @@ def main(): # testing text cleaning and entity counting
     # Text cleaning
     preprocess_tables_text(conn=conn, cursor=cursor)
 
-    # Count entities
-    entity_count, text_blocks_count = count_entities_from_tables(cursor=cursor,
-                                                                 nlp_model=nlp_model,
-                                                                 table_names=table_names)
-    num_showed: int = 10
-    print(f'Analyzed {text_blocks_count} text blocks.')
-    print(f'{num_showed} most common entities are: {[entity for entity in list(entity_count.keys())[:num_showed]]}')
+    # Adding tokenized columns
+    column_names_ordered = [['Text_content'], ['Public_description'], ['Text_content'], ['Text_content']]
+    table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
+    main_loop_for_tokenizing(cursor=cursor,
+                             nlp_model=nlp_model,
+                             table_columns_dict=table_columns_dict)
+
     conn.close()
     
 if __name__ == "__main__":
     main()
-    
-    # If I won't use SpaCy for any text cleaning/preprocessing in the future, then I might move spacy related functions out to different script,
-    # to keep this one solely related to cleaning.
-    # 
-    # Consider addressing case sensitivity in entity counting.
+
+    # Make preprocess_tables_text more modular and flexible with queries.
+    # Get rid of more emojis like: :) :( :] :[ :/ :\
