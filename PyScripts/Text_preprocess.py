@@ -134,7 +134,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
                                         Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[:;]-?(?:[a-zA-Z]+|[0-9]+)|x200B.", ""),
+                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
                                     "’", "'"),
                                 "(?<![\.\s])\n+", ". "),
                             "\n+", " "), 
@@ -142,7 +142,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                     "([.!?,-])\\1+", "\\1"), 
                 "\s{{2,}}", " ")
             );
-        """.format(local_table_names[0])) # since I am formating this way, I have to escape curly brackets inside by doubling them
+        """.format(local_table_names[0]))
 
         cursor.execute("""
             UPDATE {}
@@ -179,7 +179,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
                                         Description,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[:;]-?(?:[a-zA-Z]+|[0-9]+)|x200B.", ""),
+                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
                                     "’", "'"),
                                 "(?<![\.\s])\n+", ". "),
                             "\n+", " "), 
@@ -196,7 +196,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
                                         Public_description,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[:;]-?(?:[a-zA-Z]+|[0-9]+)|x200B.", ""),
+                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
                                     "’", "'"),
                                 "(?<![\.\s])\n+", ". "),
                             "\n+", " "), 
@@ -236,7 +236,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
                                         Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[:;]-?(?:[a-zA-Z]+|[0-9]+)|x200B.", ""),
+                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
                                     "’", "'"),
                                 "(?<![\.\s])\n+", ". "),
                             "\n+", " "), 
@@ -396,7 +396,7 @@ def main_loop_for_tokenizing(cursor: sqlite3.Cursor,
     for table_name, column_list in table_columns_dict.items():
         serialized_tokens = []
         column_name = column_list[0]
-        cursor.execute(f"SELECT Id, {column_name} FROM {table_name};") # Select primary key AND column_name
+        cursor.execute(f"SELECT Id, {column_name} FROM {table_name};")
         fetched_results = cursor.fetchall()
         for id_key, text_block in fetched_results:
             serialized_tokens.append(tokenize_and_json_serialize(nlp_model=nlp_model, text=text_block) + (id_key,))
@@ -434,4 +434,3 @@ if __name__ == "__main__":
     main()
 
     # Make preprocess_tables_text more modular and flexible with queries.
-    # Get rid of more emojis like: :) :( :] :[ :/ :\
