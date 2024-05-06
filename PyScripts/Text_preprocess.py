@@ -123,7 +123,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
             WHERE Text_content IN ('[deleted]', '[removed]', '');
         """.format(local_table_names[0]))
 
-        cursor.execute("""
+        cursor.execute(r"""
             UPDATE {}
             SET Text_content = TRIM(
             REGEX_REPLACE(
@@ -168,7 +168,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
             WHERE Public_description IN ('[deleted]', '[removed]', '');
         """.format(local_table_names[1]))
 
-        cursor.execute("""
+        cursor.execute(r"""
             UPDATE {}
             SET Description = TRIM(
             REGEX_REPLACE(
@@ -225,7 +225,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
             WHERE Text_content IN ('[deleted]', '[removed]', '');
         """.format(local_table_names[2]))
 
-        cursor.execute("""
+        cursor.execute(r"""
             UPDATE {}
             SET Text_content = TRIM(
             REGEX_REPLACE(
@@ -264,7 +264,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
             WHERE Text_content IN ('[deleted]', '[removed]', '');
         """.format(local_table_names[3]))
 
-        cursor.execute("""
+        cursor.execute(r"""
             UPDATE {}
             SET Text_content = TRIM(
             REGEX_REPLACE(
@@ -275,7 +275,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
                                         Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[:;]-?(?:[a-zA-Z]+|[0-9]+)|x200B.", ""),
+                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
                                     "’", "'"),
                                 "(?<![\.\s])\n+", ". "),
                             "\n+", " "), 
@@ -413,7 +413,7 @@ def main():
     current_dir = os.path.dirname(os.path.realpath(__file__)) # PyScripts directory path
     data_directory_name = "Data"
     data_dir = os.path.join(current_dir, '..', data_directory_name) # assuming Data and PyScripts are both in main
-    database_name = 'pocketbook.db'
+    database_name = input('Input database name (with file extension) to start cleaning: ')
     database_path = os.path.join(data_dir, database_name)
     conn = sqlite3.connect(database_path)
     cursor = conn.cursor()
