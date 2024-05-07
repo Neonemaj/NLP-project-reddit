@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 
 # config
 # if table_names will be parameterized, ensure its sanitazed to prevent dangerous injection to sql
-table_names = ('Posts', 'Subreddits', 'Comments', 'Replies')
+table_names = ('Posts', 'Comments', 'Replies')
 new_columns_global = ['Raw_tokens', 'Lemma_lower_tokens', 'Lemma_lower_stop_tokens']
 nlp_model = spacy.load('en_core_web_md')
 STOP_WORDS_SET = set(STOP_WORDS) # for faster retrieval
@@ -88,7 +88,7 @@ def create_regex_replace(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> No
 
 def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> None:
     '''
-    Cleans tables: Posts, Subreddits, Comments, Replies in the SQLite database.
+    Cleans tables: Posts, Comments, Replies in the SQLite database.
 
     Steps:
     1. Creates a SQLite function 'REGEX_REPLACE' for further regex matching and replacing.
@@ -107,194 +107,65 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
         - The function modifies the database in-place and does not return any value.
     '''
     
-    local_table_names = table_names # assuming order: Posts, Subreddits, Comments, Replies
+    local_table_names = table_names # assuming order: Posts, Comments, Replies
     # hard-coding table_columns_dict for now
-    column_names_ordered = [['Text_content'], ['Description', 'Public_description'], ['Text_content'], ['Text_content']]
-    table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
+    column_names_ordered = [['Text_content'], ['Text_content'], ['Text_content']]
+    table_columns_dict = {local_table_names[i]:column_names_ordered[i] for i in range(len(local_table_names))}
     assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict -> {table_columns_dict}'
     
     create_regex_replace(conn=conn, cursor=cursor)
     cursor.execute("BEGIN TRANSACTION;")
     try:
-        # Posts table
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content IN ('[deleted]', '[removed]', '');
-        """.format(local_table_names[0]))
+        for table_name in local_table_names:
+            cursor.execute("""
+                UPDATE {}
+                SET Text_content = NULL
+                WHERE Text_content IN ('[deleted]', '[removed]', '');
+            """.format(table_name))
 
-        cursor.execute(r"""
-            UPDATE {}
-            SET Text_content = TRIM(
-            REGEX_REPLACE(
+            cursor.execute(r"""
+                UPDATE {}
+                SET Text_content = TRIM(
                 REGEX_REPLACE(
                     REGEX_REPLACE(
                         REGEX_REPLACE(
                             REGEX_REPLACE(
                                 REGEX_REPLACE(
                                     REGEX_REPLACE(
-                                        Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
-                                    "’", "'"),
-                                "(?<![\.\s])\n+", ". "),
-                            "\n+", " "), 
-                        "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
-                    "([.!?,-])\\1+", "\\1"), 
-                "\s{{2,}}", " ")
-            );
-        """.format(local_table_names[0]))
+                                        REGEX_REPLACE(
+                                            Text_content,
+                                            "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
+                                        "’", "'"),
+                                    "(?<![\.\s])\n+", ". "),
+                                "\n+", " "), 
+                            "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
+                        "([.!?,-])\\1+", "\\1"), 
+                    "\s{{2,}}", " ")
+                );
+            """.format(table_name))
 
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content = '';
-        """.format(local_table_names[0]))
+            cursor.execute("""
+                UPDATE {}
+                SET Text_content = NULL
+                WHERE Text_content = '';
+            """.format(table_name))
 
+        # Deletion outside the loop to check on fully processed text contents
+        # Not updating Num_comments and Num_replies after deletion <- its information about raw state of post/comment
         cursor.execute("""
             DELETE FROM {}
             WHERE Num_comments = 0 AND Text_content IS NULL;
         """.format(local_table_names[0]))
-        
-        # Subreddits
-        cursor.execute("""
-            UPDATE {}
-            SET Description = NULL
-            WHERE Description IN ('[deleted]', '[removed]', '');
-        """.format(local_table_names[1]))
-
-        cursor.execute("""
-            UPDATE {}
-            SET Public_description = NULL
-            WHERE Public_description IN ('[deleted]', '[removed]', '');
-        """.format(local_table_names[1]))
-
-        cursor.execute(r"""
-            UPDATE {}
-            SET Description = TRIM(
-            REGEX_REPLACE(
-                REGEX_REPLACE(
-                    REGEX_REPLACE(
-                        REGEX_REPLACE(
-                            REGEX_REPLACE(
-                                REGEX_REPLACE(
-                                    REGEX_REPLACE(
-                                        Description,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
-                                    "’", "'"),
-                                "(?<![\.\s])\n+", ". "),
-                            "\n+", " "), 
-                        "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
-                    "([.!?,-])\\1+", "\\1"), 
-                "\s{{2,}}", " ")
-                ),
-            Public_description = TRIM(
-            REGEX_REPLACE(
-                REGEX_REPLACE(
-                    REGEX_REPLACE(
-                        REGEX_REPLACE(
-                            REGEX_REPLACE(
-                                REGEX_REPLACE(
-                                    REGEX_REPLACE(
-                                        Public_description,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
-                                    "’", "'"),
-                                "(?<![\.\s])\n+", ". "),
-                            "\n+", " "), 
-                        "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
-                    "([.!?,-])\\1+", "\\1"), 
-                "\s{{2,}}", " ")
-                );
-        """.format(local_table_names[1]))
-
-        cursor.execute("""
-            UPDATE {}
-            SET Description = NULL
-            WHERE Description = '';
-        """.format(local_table_names[1]))
-
-        cursor.execute("""
-            UPDATE {}
-            SET Public_description = NULL
-            WHERE Public_description = '';
-        """.format(local_table_names[1]))
-
-        # Comments 
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content IN ('[deleted]', '[removed]', '');
-        """.format(local_table_names[2]))
-
-        cursor.execute(r"""
-            UPDATE {}
-            SET Text_content = TRIM(
-            REGEX_REPLACE(
-                REGEX_REPLACE(
-                    REGEX_REPLACE(
-                        REGEX_REPLACE(
-                            REGEX_REPLACE(
-                                REGEX_REPLACE(
-                                    REGEX_REPLACE(
-                                        Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
-                                    "’", "'"),
-                                "(?<![\.\s])\n+", ". "),
-                            "\n+", " "), 
-                        "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
-                    "([.!?,-])\\1+", "\\1"), 
-                "\s{{2,}}", " ")
-            );
-        """.format(local_table_names[2]))
-
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content = '';
-        """.format(local_table_names[2]))
 
         cursor.execute("""
             DELETE FROM {}
             WHERE Num_replies = 0 AND Text_content IS NULL;
-        """.format(local_table_names[2]))
-        
-        # Replies
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content IN ('[deleted]', '[removed]', '');
-        """.format(local_table_names[3]))
-
-        cursor.execute(r"""
-            UPDATE {}
-            SET Text_content = TRIM(
-            REGEX_REPLACE(
-                REGEX_REPLACE(
-                    REGEX_REPLACE(
-                        REGEX_REPLACE(
-                            REGEX_REPLACE(
-                                REGEX_REPLACE(
-                                    REGEX_REPLACE(
-                                        Text_content,
-                                        "http\S+|www\S+|\S*\.com\S*|<.*?>|(?![\u2019\n])[^ -~]|[;:](?:-)?(?:([BCDOPVXbcdopvx30\(\)\[\]/\\\\*><])\\1*)|x200B.", ""),
-                                    "’", "'"),
-                                "(?<![\.\s])\n+", ". "),
-                            "\n+", " "), 
-                        "[^0-9A-Za-z()\\'?!:,. +\\-\\x22]", ""), 
-                    "([.!?,-])\\1+", "\\1"), 
-                "\s{{2,}}", " ")
-            );
-        """.format(local_table_names[3]))
-
-        cursor.execute("""
-            UPDATE {}
-            SET Text_content = NULL
-            WHERE Text_content = '';
-        """.format(local_table_names[3]))
+        """.format(local_table_names[1]))
 
         cursor.execute("""
             DELETE FROM {}
             WHERE Text_content IS NULL;
-        """.format(local_table_names[3]))
+        """.format(local_table_names[2]))
         
         cursor.execute("COMMIT;")
     
@@ -422,7 +293,7 @@ def main():
     preprocess_tables_text(conn=conn, cursor=cursor)
 
     # Adding tokenized columns
-    column_names_ordered = [['Text_content'], ['Public_description'], ['Text_content'], ['Text_content']]
+    column_names_ordered = [['Text_content'], ['Text_content'], ['Text_content']]
     table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
     main_loop_for_tokenizing(cursor=cursor,
                              nlp_model=nlp_model,
@@ -432,5 +303,3 @@ def main():
     
 if __name__ == "__main__":
     main()
-
-    # Make preprocess_tables_text more modular and flexible with queries.
