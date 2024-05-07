@@ -2,20 +2,24 @@ import praw
 from cryptography.fernet import Fernet
 import base64
 import json
-import traceback # for testing and catching errors
 import time # for timing experiments
-from typing import Tuple, Set, List, Generator, Iterable
+from typing import Tuple, List, Any, Generator, Iterable
 from itertools import chain
+from joblib import Parallel, delayed
 import os
 import re
 import sqlite3
 
-post_columns_global = ['Id', 'Title', 'Author', 'Author_flair', 'Created', 'Subreddit', 'Subreddit_id', 'Text',
+post_columns_global = ['Id', 'Title', 'Author', 'Author_flair', 'Created', 'Text',
                 'Text_content', 'Num_comments', 'Score', 'Upvote_ratio', 'Stickied', 'Distinguished', 'URL']
 comment_columns_global = ['Id', 'Author', 'Created', 'Submission_id', 'Text_content', 'Num_replies', 'Score', 'Stickied', 'Distinguished']
 reply_columns_global = ['Id', 'Author', 'Created', 'Submission_id', 'Parent_id', 'Text_content', 'Score', 'Stickied', 'Distinguished']
-subreddit_columns_global = ['Id', 'Name', 'Description', 'Public_description', 'Created', 'Subscribers']
-table_names = ('Posts', 'Subreddits', 'Comments', 'Replies')
+table_names = ('Posts', 'Comments', 'Replies')
+
+#api limits
+max_posts_per_request = 100 # current praw limit
+api_requests_limit = 600 # current limit of api requests in one time frame.
+praw_posts_limit = (api_requests_limit * max_posts_per_request + 1) // (max_posts_per_request + 1)
 
 def reddit_object(private_path: str, password: str) -> praw.reddit.Reddit:
     '''
@@ -36,7 +40,7 @@ def reddit_object(private_path: str, password: str) -> praw.reddit.Reddit:
         client_id = ci,
         client_secret = cs,
         refresh_token = rt,
-        user_agent = "nlp_project:v0.1 (by u/Neoncodemaj)",
+        user_agent = "nlp_project:v0.1 (by u/Neoncodemaj)"
     )
     return reddit
 
@@ -76,9 +80,9 @@ def start_connection(database_path: str = 'test_database.db') -> Tuple[sqlite3.C
     return conn, cursor
 
 
-def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None, table_names: Tuple[str, str, str, str]=table_names) -> None:
+def prepare_database(cursor: sqlite3.Cursor=None, table_names: Tuple[str, str, str]=table_names) -> None:
     '''
-    Creates 4 tables and 4 additional indexes (beyond 4 default ones) in current connection.
+    Creates 3 tables and 3 additional indexes (beyond 3 default ones) in current connection.
     
     Parameters:
         conn (sqlite3.Connection): SQLite database connection.
@@ -87,15 +91,10 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
     
     Notes:
         - Function modifies database in-place, does not return anything.
-        - Because of hard-coded column names, expected order of tables is: Posts, Subreddits, Comments, Replies.
+        - Because of hard-coded column names, expected order of tables is: Posts, Comments, Replies.
         - Function will atempt to use global conn and cursor objects if none were provided within parameters.
         - If tables with table_names (at least one) already exist in this database, function will wipeout all tables before proceeding.
-    '''
-    if conn is None:
-        conn = globals()['conn']
-    if cursor is None:
-        cursor = globals()['cursor']
-        
+    '''   
     cursor.execute(f'''SELECT count(name) FROM sqlite_master WHERE type='table' AND name IN {table_names};''')
     if cursor.fetchone()[0] > 0: # also assuming there already are indexes
         for table in table_names:
@@ -110,9 +109,7 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
                     Author TEXT,
                     Author_flair TEXT,
                     Created INTEGER,
-                    Subreddit TEXT,
-                    Subreddit_id TEXT,
-                    Text TEXT,
+                    Text INTEGER,
                     Text_content TEXT,
                     Num_comments INTEGER,
                     Score INTEGER,
@@ -125,18 +122,6 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
 
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS {table_names[1]} (
-                    Id TEXT PRIMARY KEY,
-                    Name TEXT,
-                    Description TEXT,
-                    Public_description TEXT,
-                    Created INTEGER,
-                    Subscribers INTEGER,
-                    FOREIGN KEY (Id) REFERENCES Posts(Subreddit_id) ON DELETE CASCADE
-                );
-            ''')
-
-            cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS {table_names[2]} (
                     Id TEXT PRIMARY KEY,
                     Author TEXT,
                     Created INTEGER,
@@ -151,7 +136,7 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
             ''')
 
             cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS {table_names[3]} (
+                CREATE TABLE IF NOT EXISTS {table_names[2]} (
                     Id TEXT PRIMARY KEY,
                     Author TEXT,
                     Created INTEGER,
@@ -165,8 +150,7 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
                     FOREIGN KEY (Parent_id) REFERENCES Comments(Comment_id) ON DELETE CASCADE
                 );
             ''')
-
-            cursor.execute('CREATE INDEX idx_Posts_Subreddit_id ON Posts(Subreddit_id);')
+            
             cursor.execute('CREATE INDEX idx_Comments_Submission_id ON Comments(Submission_id);')
             cursor.execute('CREATE INDEX idx_Replies_Submission_id ON Replies(Submission_id);')
             cursor.execute('CREATE INDEX idx_Replies_Parent_id ON Replies(Parent_id);')
@@ -178,111 +162,6 @@ def prepare_database(conn: sqlite3.Connection=None, cursor: sqlite3.Cursor=None,
         except Exception as e:
             print("Error:", e.__class__.__name__, "\n", e)
             cursor.execute("ROLLBACK;")
-            
-def process_post_batch(posts: List[praw.models.Submission],
-                       comments_limit: int,
-                       replies_limit: int) -> Tuple[Set[Tuple], Set[Tuple], Set[Tuple], Set[Tuple]]:
-    '''
-    Processes a batch of Reddit posts extracting crucial data.
-    Collects information from posts and subreddits,
-    then sends related comments to these posts and replies to these comments to process_comments() where more data is gathered.
-    
-    Notes:
-        - Function handles almost all duplicates with use of sets.
-            There are cases where the same subreddit returns different information from different snapshots.
-    '''
-    comment_data = set()
-    reply_data = set()
-    post_data = set()
-    subreddit_data = set()
-
-    for post in posts:
-        subreddit = post.subreddit
-        post_data.add((
-            post.id,
-            post.title,
-            post.author.name if post.author else None,
-            post.author_flair_text,
-            post.created_utc,
-            subreddit.display_name,
-            subreddit.id,
-            post.is_self,
-            post.selftext if post.selftext else None,
-            post.num_comments,
-            post.score,
-            post.upvote_ratio,
-            post.stickied,
-            post.distinguished,
-            post.url
-        ))
-        subreddit_data.add((
-            subreddit.id,
-            subreddit.display_name,
-            subreddit.description,
-            subreddit.public_description,
-            subreddit.created_utc,
-            subreddit.subscribers
-        ))
-        comment_batch, reply_batch = process_comments(post, comments_limit, replies_limit)
-        comment_data.update(comment_batch)
-        reply_data.update(reply_batch)
-
-    return post_data, subreddit_data, comment_data, reply_data
-
-def process_comments(post: praw.models.Submission, comments_limit: int, replies_limit: int) -> Tuple[Set[Tuple], Set[Tuple]]:
-    '''
-    Processes comments and replies to these comments to gather data.
-    
-    Parameters:
-        post (praw.models.Submission): Reddit post object from which comments and replies will be extracted.
-        comments_limit (int): Limit of how many comments process in current post. Will return less if less are available.
-        replies_limit (int): Limit of how many replies process to fetched comments. Will return less if less are available.
-        
-    Notes:
-        - Some parent_id are created using methods on parent object, not method .parent_id which returns with prefixes.
-    '''
-    comment_data = set()
-    reply_data = set()
-   
-    for comment in post.comments[:comments_limit]:
-        if isinstance(comment, praw.models.MoreComments):
-            break
-        
-        batch_replies = set()
-        num_replies = 0 
-        for reply in comment.replies[:replies_limit]:
-            # Nesting loop inside a loop and not separate function because of joblib.Parallel:
-            # Cannot pass unserializable objects as function parameters
-            if isinstance(reply, praw.models.MoreComments):
-                break
-            
-            batch_replies.add((
-                reply.id,
-                reply.author.name if reply.author else None,
-                reply.created_utc,
-                post.id,
-                comment.id,
-                reply.body,
-                reply.score,
-                reply.stickied,
-                reply.distinguished
-            ))
-            num_replies += 1
-        reply_data.update(batch_replies)
-        
-        comment_data.add((
-            comment.id,
-            comment.author.name if comment.author else None,
-            comment.created_utc,
-            post.id,
-            comment.body,
-            num_replies,
-            comment.score,
-            comment.stickied,
-            comment.distinguished
-        ))
-
-    return comment_data, reply_data
 
 def batch_generator(iterable: Iterable, batch_size: int) -> Generator:
     '''
@@ -296,56 +175,15 @@ def batch_generator(iterable: Iterable, batch_size: int) -> Generator:
             batch = []
     if batch:
         yield batch
-
-def fill_tables(query: str,
-                posts_limit: int = 100,
-                comments_limit: int = 50,
-                replies_limit: int = 20,
-                conn: sqlite3.Connection = None,
-                cursor: sqlite3.Cursor = None,
-                reddit: praw.reddit.Reddit = None,
-                table_names: Tuple[str, str, str, str] = table_names) -> None:
+        
+def praw_get_data(query: str,
+                  posts_limit: int = 100,
+                  reddit: praw.reddit.Reddit = None) -> List:
     '''
-    Gathers data from Reddit API by making requests and inserts it into SQL tables.
-    
-    Parameters:
-        query (str): Search query used to extract posts sorted by highest relevance to this query.
-            Can use boolean logic supported by Reddit in searches.
-        posts_limit (int): Limit of posts retrieved. Default 100.
-        comments_limit (int): Limit of comments retrieved from posts. Default 50.
-        replies_limit (int): Limit of replies retrieved from comments. Default 20.
-        conn (sqlite3.Connection): SQLite database connection.
-        cursor (sqlite3.Cursor): SQLite database cursor.
-        reddit (praw.reddit.Reddit): Reddit object needed to make requests to API.
-        table_names (Tuple[str, str, str, str]): Table names, assumed order: Posts, Subreddits, Comments, Replies.
-    
-    Notes:
-        - Uses INSERT OR IGNORE to fill data because of existance of different snapshots of the same object.
-            Primary key constraint helps here to avoid duplicates.
-        - Function will try to use global objects if none provided: conn, cursor, reddit.
-        - Higher values for limit parameters (especially posts_limit) will result in longer processing.
-            Function won't try to return more than 10000 posts to avoid hitting rate limit of API.
+    Searches all subreddits by relevance for submitted query and retrieves 'posts_limit' number of posts in a list of praw objects.
     '''
-    if conn is None:
-        conn = globals()['conn']
-    if cursor is None:
-        cursor = globals()['cursor']
-    if reddit is None:
-        reddit = globals()['reddit']
-    
-    native_limit = 100 # current limit in Reddit API
-    comments_limit = min(comments_limit, 100) # max 100
-    replies_limit = min(replies_limit, 100) # max 100
-    posts_limit = min(posts_limit, 10000)
-    post_data = set()
-    subreddit_data = set()
-    comment_data = set()
-    reply_data = set()
-    post_columns_local, subreddit_columns_local = post_columns_global, subreddit_columns_global
-    comment_columns_local, reply_columns_local = comment_columns_global, reply_columns_global
-    
-    if posts_limit > native_limit:
-        div, mod = divmod(posts_limit, native_limit)
+    if posts_limit > max_posts_per_request:
+        div, mod = divmod(posts_limit, max_posts_per_request)
         last_post_id = None
         after_param = None
         result_collection = chain()
@@ -356,7 +194,7 @@ def fill_tables(query: str,
                 after_param = last_post_id
 
             search_results = list(reddit.subreddit('all').search(query,
-                                                                 limit=native_limit if i != div else mod,
+                                                                 limit=max_posts_per_request if i != div else mod,
                                                                  params={'after': after_param}))
             
             result_collection = chain(result_collection, search_results)
@@ -365,28 +203,132 @@ def fill_tables(query: str,
     else:
         result_collection = reddit.subreddit('all').search(query, limit=posts_limit)
 
-    results = process_post_batch(result_collection, comments_limit, replies_limit)
-    post_data = results[0]
-    subreddit_data = results[1]
-    comment_data = results[2]
-    reply_data = results[3]
+    return list(result_collection)
         
+def process_posts(posts_batch: List[praw.models.Submission],
+                  comments_limit: int,
+                  replies_limit: int) -> List[List[List[Any]]]:
+    '''
+    Processes a batch of Reddit posts extracting crucial data.
+    Collects information from posts, comments to these posts, and replies to these comments (only 1st level of depth).
+    '''
+    comment_data = []
+    reply_data = []
+    post_data = []
+
+    for post in posts_batch:
+        post_data.append([
+            post.id,
+            post.title,
+            post.author.name if post.author else None,
+            post.author_flair_text,
+            post.created_utc,
+            int(post.is_self),
+            post.selftext,
+            post.num_comments,
+            post.score,
+            post.upvote_ratio,
+            post.stickied,
+            post.distinguished,
+            post.url
+        ])
+        
+        batch_comments = []
+        for comment in post.comments[:comments_limit]:
+            if isinstance(comment, praw.models.MoreComments):
+                break
+            
+            batch_replies = []
+            num_replies = 0 
+            for reply in comment.replies[:replies_limit]:
+                if isinstance(reply, praw.models.MoreComments):
+                    break
+                
+                batch_replies.append([
+                    reply.id,
+                    reply.author.name if reply.author else None,
+                    reply.created_utc,
+                    post.id,
+                    comment.id,
+                    reply.body,
+                    reply.score,
+                    reply.stickied,
+                    reply.distinguished
+                ])
+                num_replies += 1
+            reply_data.extend(batch_replies)
+            
+            batch_comments.append([
+                comment.id,
+                comment.author.name if comment.author else None,
+                comment.created_utc,
+                post.id,
+                comment.body,
+                num_replies,
+                comment.score,
+                comment.stickied,
+                comment.distinguished
+            ])
+        comment_data.extend(batch_comments)   
+
+    return [post_data, comment_data, reply_data]
+    
+def fill_tables(cursor: sqlite3.Cursor,
+                reddit: praw.reddit.Reddit,
+                query: str,
+                posts_limit: int,
+                comments_limit: int,
+                replies_limit: int,
+                table_names: Tuple[str, str, str]) -> None:
+    '''
+    Gathers data from Reddit API by making requests and inserts it into SQL tables.
+    
+    Parameters:
+        cursor (sqlite3.Cursor): SQLite database cursor.
+        reddit (praw.reddit.Reddit): Reddit object needed to make requests to API.
+        query (str): Search query used to extract posts sorted by highest relevance to this query.
+            Can use boolean logic supported by Reddit in searches.
+        posts_limit (int): Limit of posts retrieved. Won't exceed global variable praw_posts_limit.
+        comments_limit (int): Limit of comments retrieved from posts. Maximum 100.
+        replies_limit (int): Limit of replies retrieved from comments. Maximum 100.
+        table_names (Tuple[str, str, str, str]): Table names, assumed order: Posts, Subreddits, Comments, Replies.
+    
+    Notes:
+        - Uses INSERT OR IGNORE to fill data because of existance of different snapshots of the same object.
+            Primary key constraint helps here to avoid duplicates.
+        - Function will utilitize maximum number of available cpu cores.
+    '''
+    post_columns_local = post_columns_global
+    comment_columns_local, reply_columns_local = comment_columns_global, reply_columns_global
+    posts_limit = min(praw_posts_limit, posts_limit)
+    result_collection = praw_get_data(query=query,
+                                      posts_limit=posts_limit,
+                                      reddit=reddit)
+    
+    batch_size = (posts_limit // (2 * os.cpu_count())) + 1
+    results = Parallel(n_jobs=-1)(delayed(process_posts)(posts_batch, comments_limit, replies_limit) for posts_batch in batch_generator(result_collection, batch_size))
+    aggregated_posts = []
+    aggregated_comments = []
+    aggregated_replies = []
+
+    for post_list, comment_list, reply_list in results:
+        aggregated_posts.extend(post_list)
+        aggregated_comments.extend(comment_list)
+        aggregated_replies.extend(reply_list)
+    
     insert_posts_query = f'INSERT OR IGNORE INTO {table_names[0]} ({", ".join(post_columns_local)}) VALUES ({", ".join(["?"] * len(post_columns_local))})'
-    insert_subreddits_query = f'INSERT OR IGNORE INTO {table_names[1]} ({", ".join(subreddit_columns_local)}) VALUES ({", ".join(["?"] * len(subreddit_columns_local))})'
-    insert_comments_query = f'INSERT OR IGNORE INTO {table_names[2]} ({", ".join(comment_columns_local)}) VALUES ({", ".join(["?"] * len(comment_columns_local))})'
-    insert_replies_query = f'INSERT OR IGNORE INTO {table_names[3]} ({", ".join(reply_columns_local)}) VALUES ({", ".join(["?"] * len(reply_columns_local))})'
+    insert_comments_query = f'INSERT OR IGNORE INTO {table_names[1]} ({", ".join(comment_columns_local)}) VALUES ({", ".join(["?"] * len(comment_columns_local))})'
+    insert_replies_query = f'INSERT OR IGNORE INTO {table_names[2]} ({", ".join(reply_columns_local)}) VALUES ({", ".join(["?"] * len(reply_columns_local))})'
     
     cursor.execute("BEGIN TRANSACTION;")
     try:
-        cursor.executemany(insert_posts_query, post_data)
-        cursor.executemany(insert_subreddits_query, subreddit_data)
-        cursor.executemany(insert_comments_query, comment_data)
-        cursor.executemany(insert_replies_query, reply_data)
+        cursor.executemany(insert_posts_query, aggregated_posts)
+        cursor.executemany(insert_comments_query, aggregated_comments)
+        cursor.executemany(insert_replies_query, aggregated_replies)
         cursor.execute("COMMIT;")
         
     except sqlite3.Error as e:
         print("SQLite error:", e.__class__.__name__, "\n", e)
-        print(traceback.format_etc())
         cursor.execute("ROLLBACK;")
     except Exception as e:
         print("Error:", e.__class__.__name__, "\n", e)
@@ -421,16 +363,16 @@ def main(): # for testing
     
     reddit = reddit_object(private_path=private_path, password=password)
     conn, cursor = start_connection(database_path=os.path.join(data_dir, database_name))
-    prepare_database(conn=conn, cursor=cursor)
+    prepare_database(cursor=cursor)
     print(f'Inserting values into database {database_name}...')
     start_time = time.time()
-    fill_tables(query=query,
+    fill_tables(cursor=cursor,
+                reddit=reddit,
+                query=query,
                 posts_limit=300,
                 comments_limit=50,
                 replies_limit=20,
-                conn=conn,
-                cursor=cursor,
-                reddit=reddit)
+                table_names=table_names)
     end_time = time.time()
     print(f'Operation complete, database filled.\nTime taken: {end_time - start_time:.4f} seconds.')
     conn.close()
@@ -439,9 +381,4 @@ if __name__ == "__main__":
     main()
     
     # To do:
-    #   set posts/comments/replies limits to be either as a presets in file inside 'config', or UI sliders
-    #   Implement Logging and correct except blocks.
-    #   Rebuild fill_tables() to improve performance - Creating a lazy generator over posts and using 'multiprocessing' or 'concurrent.features'
-    #       to setup workers to handle smaller portions of data like comments and replies. Generator pipeline waits and proceeds to next posts
-    #       only if all workers finished their job.
-    #       Also implement error handling within workers that would propagate these errors to main generator.
+    #   Implement Logging.
