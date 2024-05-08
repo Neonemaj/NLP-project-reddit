@@ -10,34 +10,34 @@ from typing import Dict, List, Tuple
 # config
 # if table_names will be parameterized, ensure its sanitazed to prevent dangerous injection to sql
 table_names = ('Posts', 'Comments', 'Replies')
+text_content_column_name = 'Text_content'
+table_columns_dict = {table:text_content_column_name for table in table_names}
 new_columns_global = ['Raw_tokens', 'Lemma_lower_tokens', 'Lemma_lower_stop_tokens']
 nlp_model = spacy.load('en_core_web_md')
 STOP_WORDS_SET = set(STOP_WORDS) # for faster retrieval
 
-def check_column_exist(cursor: sqlite3.Cursor, check_dict: Dict[str, List[str]]) -> bool:
+def check_column_exist(cursor: sqlite3.Cursor, check_dict: Dict[str, str]) -> bool:
     '''
-    Checks if all given columns exist in the corresponding tables.
+    Checks if a given column exist in the corresponding table.
 
     Parameters:
         cursor (sqlite3.Cursor): SQLite cursor object for executing SQL queries.
-        check_dict (Dict[str, List[str]]): Dictionary where keys are table names
-            and values are lists of column names to check.
+        check_dict (Dict[str, str]): Dictionary where keys are table names
+            and values are column names to check.
 
     Returns:
         bool: True if all columns exist in the tables, False otherwise.
 
     Example:
         check_column_exist(cursor, {
-            'table1': ['column1', 'column2'],
-            'table2': ['column3'],
-            'table3': []
+            'table1': 'column1',
+            'table2': 'column2',
         })
     '''
-    for table_name, column_list in check_dict.items():
-        for column_name in column_list:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            if not any(column_name == col[1] for col in cursor.fetchall()):
-                return False
+    for table_name, column_name in check_dict.items():
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        if not any(column_name == col[1] for col in cursor.fetchall()):
+            return False
     return True
 
 def regex_replace(text: str, pattern: str, replacement: str) -> str:
@@ -76,7 +76,7 @@ def create_regex_replace(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> No
         - Raises AssertionError if REGEX_REPLACE works incorrectly (for example by having wrong order of parameters)
     '''
     try:
-        conn.execute("SELECT REGEX_REPLACE('test', 'est', 'ry')")
+        cursor.execute("SELECT REGEX_REPLACE('test', 'est', 'ry')")
         result = cursor.fetchall()
         assert result == [('try',)], (
             "REGEX_REPLACE exists in this connection, but provided unexpected output.\n"
@@ -106,13 +106,7 @@ def preprocess_tables_text(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> 
         - Column names are not parameterized, but table names are linked to the global variable table_names.
         - The function modifies the database in-place and does not return any value.
     '''
-    
     local_table_names = table_names # assuming order: Posts, Comments, Replies
-    # hard-coding table_columns_dict for now
-    column_names_ordered = [['Text_content'], ['Text_content'], ['Text_content']]
-    table_columns_dict = {local_table_names[i]:column_names_ordered[i] for i in range(len(local_table_names))}
-    assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict -> {table_columns_dict}'
-    
     create_regex_replace(conn=conn, cursor=cursor)
     cursor.execute("BEGIN TRANSACTION;")
     try:
@@ -218,7 +212,6 @@ def create_columns_insert_tokens(cursor: sqlite3.Cursor, table_name: str, serial
         - Function modifies table in-place and does not return any value.
         - This function will only create missing columns <-> won't create any if there already are these 3 exact columns in a table.
         - Function overwrites values that already exist in those columns.
-        - Raises AssertionError when the length of serialized_values do not match length of a table.
     '''
     new_columns = new_columns_global
     cursor.execute("BEGIN TRANSACTION;")
@@ -259,10 +252,8 @@ def main_loop_for_tokenizing(cursor: sqlite3.Cursor,
     Notes:
         - Returns nothing. Gathers text blocks/columns to use for functions:
             tokenize_and_json_serialize() and create_columns_insert_tokens().
-        - Raises AssertionError when one or more columns were not found in tables according to a structure of table_columns_dict.
         - Raises AssertionError when the length of serialized_values do not match length of a table.
     '''
-    assert check_column_exist(cursor, table_columns_dict), f'One or more columns were not found in tables\ntable:columns dict -> {table_columns_dict}'
     
     for table_name, column_list in table_columns_dict.items():
         serialized_tokens = []
@@ -289,12 +280,13 @@ def main():
     conn = sqlite3.connect(database_path)
     cursor = conn.cursor()
 
+    assert check_column_exist(cursor=cursor, check_dict=table_columns_dict), (
+        f'At least one table doesn\'t have text content column: {text_content_column_name}')
+    
     # Text cleaning
     preprocess_tables_text(conn=conn, cursor=cursor)
 
     # Adding tokenized columns
-    column_names_ordered = [['Text_content'], ['Text_content'], ['Text_content']]
-    table_columns_dict = {table_names[i]:column_names_ordered[i] for i in range(len(table_names))}
     main_loop_for_tokenizing(cursor=cursor,
                              nlp_model=nlp_model,
                              table_columns_dict=table_columns_dict)
